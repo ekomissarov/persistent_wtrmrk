@@ -174,10 +174,8 @@ def embed(rgb: np.ndarray, message: str, debug: bool = False) -> np.ndarray | tu
     updated_y = idctn(c, axes=(-2, -1), norm='ortho').transpose(0, 2, 1, 3).reshape(hh, ww)
     pixels[:hh, :ww] += (updated_y - y[:hh, :ww])[:, :, None]
     result = np.clip(np.rint(pixels), 0, 255).astype(np.uint8)
-
     if not debug:
         return result
-
     debug_image = result.copy()
     for by, bx in np.argwhere(modified):
         x1, y1 = int(bx * BLOCK), int(by * BLOCK)
@@ -206,7 +204,7 @@ def _fold(data: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return sums, np.outer(cy, cx)
 
 
-def _decode(sums: np.ndarray, counts: np.ndarray, tile_y: int, tile_x: int) -> str | None:
+def _decode(sums: np.ndarray, counts: np.ndarray, tile_y: int, tile_x: int, deep: bool = False) -> str | None:
     sums = np.roll(sums, (-tile_y, -tile_x), axis=(0, 1)).ravel()
     counts = np.roll(counts, (-tile_y, -tile_x), axis=(0, 1)).ravel()
     soft = sums[data_indices] / np.maximum(1., counts[data_indices])
@@ -214,24 +212,35 @@ def _decode(sums: np.ndarray, counts: np.ndarray, tile_y: int, tile_x: int) -> s
     result = _unframe(_decode_hamming(bits))
     if result is not None:
         return result
-    # Hamming corrects isolated errors. Retry a few ambiguous observations.
-    least_certain = np.argsort(np.abs(soft))[:8]
-    for i in least_certain:
+    # Try alternative decisions at the least reliable bit positions.
+    uncertain = np.argsort(np.abs(soft))[:16 if deep else 8]
+    for i in uncertain:
         alt = bits.copy()
         alt[i] ^= 1
         result = _unframe(_decode_hamming(alt))
         if result is not None:
             return result
+    if deep:
+        # Two-bit ambiguity recovery (CRC32 validates the whole message).
+        for x, i in enumerate(uncertain[:12]):
+            for j in uncertain[x+1:12]:
+                alt = bits.copy()
+                alt[i] ^= 1
+                alt[j] ^= 1
+                result = _unframe(_decode_hamming(alt))
+                if result is not None:
+                    return result
     return None
 
 
-def _detect(y: np.ndarray) -> tuple[str | None, float]:
-    """Search every 16-pixel alignment and 20x20 tile phase with known pilots."""
+def _detect(y: np.ndarray, deep: bool = False) -> tuple[str | None, float]:
+    """Search DCT block alignment and periodic pilot phase."""
     if min(y.shape) < 130:
         return None, 0.
     diff = _differences(y)
     h, w = diff.shape
     candidates = []
+    phases = 10 if deep else 2
     for oy in range(BLOCK):
         rows = np.arange(8 + oy, h - 8, BLOCK)
         if len(rows) < 2:
@@ -246,13 +255,13 @@ def _detect(y: np.ndarray) -> tuple[str | None, float]:
             observations = np.fft.ifft2(np.fft.fft2(counts) * pilot_abs_fft).real
             z = correlation / ((float(np.std(sampled)) + 1e-4) * np.sqrt(np.maximum(1, observations)))
             flat = z.ravel()
-            for idx in np.argpartition(flat, -8)[-8:]:
-                if flat[idx] > 2.5:
+            for idx in np.argpartition(flat, -phases)[-phases:]:
+                if deep or flat[idx] > 2.5:
                     sy, sx = np.unravel_index(idx, z.shape)
                     candidates.append((float(flat[idx]), sums, counts, sy, sx))
     candidates.sort(key=lambda c: c[0], reverse=True)
-    for score, sums, counts, sy, sx in candidates[:40]:
-        result = _decode(sums, counts, sy, sx)
+    for score, sums, counts, sy, sx in candidates[:120 if deep else 40]:
+        result = _decode(sums, counts, sy, sx, deep=deep)
         if result is not None:
             return result, score
     return None, candidates[0][0] if candidates else 0.
@@ -266,48 +275,45 @@ def _rotate(y: np.ndarray, angle: float) -> np.ndarray:
 
 
 def extract(rgb: np.ndarray) -> str | None:
-    """Find the fixed public watermark after crop, resize, and small deskew.
-
-    Automatic scale search is deliberately bounded. Repeated rescans with
-    geometric distortion, perspective warps, or tiny crops may still fail.
-    """
+    """Fast search, then a more exhaustive search without changing the watermark."""
     if rgb.shape[0] * rgb.shape[1] > MAX_PIXELS:
         raise ValueError(f'Image exceeds {MAX_PIXELS:,} pixels.')
     a = rgb.astype(np.float32)
     y = .299*a[:, :, 0] + .587*a[:, :, 1] + .114*a[:, :, 2]
-
-    # Frequent resize ratios, including their inverses. These are only search
-    # priorities, not different watermark algorithms or user-selectable modes.
     common = (1., 2., 1.333333333, 1.25, 1.428571429, 1.666666667,
               1.176470588, 1.111111111, 1.5, .8, .666666667, .5, 1.2)
+    angles = (0., -.5, .5, -1., 1.)
     ranked = []
 
-    def check(upright: np.ndarray, multiplier: float, collect: bool = False) -> str | None:
+    def check(upright: np.ndarray, multiplier: float, deep: bool = False, collect: bool = False) -> str | None:
         hh, ww = upright.shape
         width, height = round(ww * multiplier), round(hh * multiplier)
         if min(height, width) < 128 or (multiplier > 1 and max(height, width) > 3600) or height * width > MAX_PIXELS:
             return None
         scaled = (upright if multiplier == 1 else
                   cv2.resize(upright, (width, height), interpolation=cv2.INTER_CUBIC if multiplier > 1 else cv2.INTER_AREA))
-        found, strength = _detect(scaled)
+        found, strength = _detect(scaled, deep=deep)
         if collect:
             ranked.append((strength, multiplier))
         return found
 
-    for scale in common:
-        result = check(y, scale)
-        if result is not None:
-            return result
-
-    angles = (-.5, .5, -1., 1.)
+    # Fast path: common resize ratios and minor deskew angles.
     for angle in angles:
-        deskewed = _rotate(y, angle)
+        upright = y if angle == 0 else _rotate(y, angle)
         for scale in common:
-            result = check(deskewed, scale)
+            result = check(upright, scale)
             if result is not None:
                 return result
 
-    # Automatic unknown DPI/resize ratio recovery at zero rotation.
+    # Deep path: fewer early rejections, more phases, bit decisions and candidates.
+    for angle in angles:
+        upright = y if angle == 0 else _rotate(y, angle)
+        for scale in common:
+            result = check(upright, scale, deep=True)
+            if result is not None:
+                return result
+
+    # Fine scale search without rotation first; collect promising scale hypotheses.
     fine = sorted(np.arange(.75, 1.551, .005), key=lambda s: abs(math.log(s)))
     for scale in fine:
         if min(abs(scale - c) for c in common) < .003:
@@ -316,23 +322,23 @@ def extract(rgb: np.ndarray) -> str | None:
         if result is not None:
             return result
 
-    # If scale AND rotation both changed, use the highest synchronization
-    # responses to shortlist plausible scale neighborhoods for deskewing.
     selected = []
     for _, scale in sorted(ranked, reverse=True):
-        if all(abs(scale - old) >= .025 for old in selected):
-            selected.append(scale)
-        if len(selected) == 3:
+        if all(abs(scale - old) >= .02 for old in selected):
+            selected.append(float(scale))
+        if len(selected) == 8:
             break
-    candidates = []
+
+    # Spend the additional time on the most promising scales and nearby rotations.
     for scale in selected:
-        candidates.extend((scale + offset for offset in (-.02, -.01, 0., .01, .02)))
-    # Each hypothesis still decodes exactly the same single fixed format.
-    for angle in angles:
-        deskewed = _rotate(y, angle)
-        for scale in candidates:
-            if scale > 0:
-                result = check(deskewed, scale)
+        result = check(y, scale, deep=True)
+        if result is not None:
+            return result
+    for angle in angles[1:]:
+        upright = _rotate(y, angle)
+        for scale in selected:
+            for offset in (-.01, 0., .01):
+                result = check(upright, scale + offset, deep=True)
                 if result is not None:
                     return result
     return None
@@ -345,7 +351,7 @@ def main() -> int:
     encoder.add_argument('input', type=Path)
     encoder.add_argument('output', type=Path)
     encoder.add_argument('message')
-    encoder.add_argument('--debug', action='store_true', help='Save an additional image highlighting modified DCT blocks')
+    encoder.add_argument('--debug', action='store_true', help='Save a PNG with red borders around modified DCT blocks')
     decoder = commands.add_parser('extract', help='Read the hidden text; no original required')
     decoder.add_argument('input', type=Path)
     args = parser.parse_args()
@@ -354,10 +360,9 @@ def main() -> int:
             if args.output.exists():
                 raise FileExistsError(f'Output already exists: {args.output}')
             _frame(args.message)
-            if args.debug:
-                debug_path = args.output.with_name(args.output.stem + '_debug.png')
-                if debug_path.exists():
-                    raise FileExistsError(f'Debug output already exists: {debug_path}')
+            debug_path = args.output.with_name(args.output.stem + '_debug.png') if args.debug else None
+            if debug_path is not None and debug_path.exists():
+                raise FileExistsError(f'Debug output already exists: {debug_path}')
             result = embed(_load(args.input), args.message, debug=args.debug)
             image, debug_image = result if args.debug else (result, None)
             _save(image, args.output)
