@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Minimal, public, blind watermark for images (experimental print/scan prototype).
+"""Document-aware public blind watermark (experimental print/scan prototype).
 
 Usage:
   python watermark.py embed photo.jpg marked.png "Short text"
+  python watermark.py embed photo.jpg marked.png "Short text" --debug
   python watermark.py extract marked.png
 
-One fixed algorithm: DCT pair modulation, repeated 320x320-pixel tiles,
+One fixed algorithm: adaptive DCT pair modulation, repeated 320x320-pixel tiles,
 public synchronization pilots, interleaved Hamming(15,11), CRC32.
 No secrets, signatures, or proof of image authorship. In particular anyone
 who knows this algorithm can overwrite or intentionally disrupt the watermark.
@@ -32,7 +33,7 @@ FRAME_BYTES = 1 + MAX_MESSAGE_BYTES + 4  # length, padded text, CRC32
 FRAME_BITS = FRAME_BYTES * 8
 PARITY_BITS = 4
 CODE_BITS = 15 * math.ceil(FRAME_BITS / 11)  # Hamming(15, 11): 240 bits
-STRENGTH = 80.0
+STRENGTH = 115.0  # maximum DCT margin on textured non-text regions
 MAX_PIXELS = 16_000_000
 COEFF_A = (2, 3)
 COEFF_B = (3, 2)
@@ -129,7 +130,12 @@ def _save(rgb: np.ndarray, output: Path) -> None:
             tmp.unlink(missing_ok=True)
 
 
-def embed(rgb: np.ndarray, message: str) -> np.ndarray:
+def embed(rgb: np.ndarray, message: str, debug: bool = False) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    """Embed in textured regions while sparing paper, characters and flat areas.
+
+    The mask is deterministic from local image statistics, so extraction does
+    not need the original. This is *not* OCR or a certified document mask.
+    """
     h, w = rgb.shape[:2]
     if h < BLOCK * TILE or w < BLOCK * TILE:
         raise ValueError(f'Image must be at least {BLOCK * TILE}x{BLOCK * TILE} pixels.')
@@ -139,16 +145,44 @@ def embed(rgb: np.ndarray, message: str) -> np.ndarray:
     pixels = rgb.astype(np.float32)
     y = .299 * pixels[:, :, 0] + .587 * pixels[:, :, 1] + .114 * pixels[:, :, 2]
     blocks = y[:hh, :ww].reshape(bh, BLOCK, bw, BLOCK).transpose(0, 2, 1, 3).copy()
+
+    # Compute image-aware embedding mask using 16x16 block statistics.
+    # White paper is skipped; fine high-contrast edges (often glyph strokes)
+    # are skipped; continuous midtone/texture is preferred.
+    mean = blocks.mean(axis=(2, 3))
+    std = blocks.std(axis=(2, 3))
+    bright_paper = np.clip((246.0 - mean) / 32.0, 0, 1)
+    textured = np.clip((std - 5.0) / 20.0, 0, 1)
+    # Detect likely black-on-white text (very bright pixels + very dark pixels
+    # in the same tile). Avoid modifying these tiles.
+    white_fraction = (blocks >= 235).mean(axis=(2, 3))
+    black_fraction = (blocks <= 100).mean(axis=(2, 3))
+    text_like = (white_fraction > .40) & (black_fraction > .015)
+    weight = bright_paper * textured * (~text_like)
+    # Absolute minimum mask: no pixel modifications on excluded blocks.
+    active = weight >= .20
+
     c = dctn(blocks, axes=(-2, -1), norm='ortho')
     a = c[:, :, COEFF_A[0], COEFF_A[1]]
     b = c[:, :, COEFF_B[0], COEFF_B[1]]
     wanted = np.tile(pattern, (math.ceil(bh / TILE), math.ceil(bw / TILE)))[:bh, :bw]
-    correction = np.maximum(0., STRENGTH - (a - b) * wanted) * wanted / 2
+    target = STRENGTH * weight
+    correction = np.where(active, np.maximum(0., target - (a - b) * wanted), 0.) * wanted / 2
+    modified = active & (np.abs(correction) > 1e-6)
     a += correction
     b -= correction
     updated_y = idctn(c, axes=(-2, -1), norm='ortho').transpose(0, 2, 1, 3).reshape(hh, ww)
     pixels[:hh, :ww] += (updated_y - y[:hh, :ww])[:, :, None]
-    return np.clip(np.rint(pixels), 0, 255).astype(np.uint8)
+    result = np.clip(np.rint(pixels), 0, 255).astype(np.uint8)
+
+    if not debug:
+        return result
+
+    debug_image = result.copy()
+    for by, bx in np.argwhere(modified):
+        x1, y1 = int(bx * BLOCK), int(by * BLOCK)
+        cv2.rectangle(debug_image, (x1, y1), (x1 + BLOCK - 1, y1 + BLOCK - 1), (255, 0, 0), 1)
+    return result, debug_image
 
 
 def _basis(index: int) -> np.ndarray:
@@ -212,12 +246,12 @@ def _detect(y: np.ndarray) -> tuple[str | None, float]:
             observations = np.fft.ifft2(np.fft.fft2(counts) * pilot_abs_fft).real
             z = correlation / ((float(np.std(sampled)) + 1e-4) * np.sqrt(np.maximum(1, observations)))
             flat = z.ravel()
-            for idx in np.argpartition(flat, -2)[-2:]:
-                if flat[idx] > 3.5:
+            for idx in np.argpartition(flat, -8)[-8:]:
+                if flat[idx] > 2.5:
                     sy, sx = np.unravel_index(idx, z.shape)
                     candidates.append((float(flat[idx]), sums, counts, sy, sx))
     candidates.sort(key=lambda c: c[0], reverse=True)
-    for score, sums, counts, sy, sx in candidates[:12]:
+    for score, sums, counts, sy, sx in candidates[:40]:
         result = _decode(sums, counts, sy, sx)
         if result is not None:
             return result, score
@@ -274,7 +308,7 @@ def extract(rgb: np.ndarray) -> str | None:
                 return result
 
     # Automatic unknown DPI/resize ratio recovery at zero rotation.
-    fine = sorted(np.arange(.75, 1.551, .01), key=lambda s: abs(math.log(s)))
+    fine = sorted(np.arange(.75, 1.551, .005), key=lambda s: abs(math.log(s)))
     for scale in fine:
         if min(abs(scale - c) for c in common) < .003:
             continue
@@ -311,6 +345,7 @@ def main() -> int:
     encoder.add_argument('input', type=Path)
     encoder.add_argument('output', type=Path)
     encoder.add_argument('message')
+    encoder.add_argument('--debug', action='store_true', help='Save an additional image highlighting modified DCT blocks')
     decoder = commands.add_parser('extract', help='Read the hidden text; no original required')
     decoder.add_argument('input', type=Path)
     args = parser.parse_args()
@@ -319,9 +354,17 @@ def main() -> int:
             if args.output.exists():
                 raise FileExistsError(f'Output already exists: {args.output}')
             _frame(args.message)
-            image = embed(_load(args.input), args.message)
+            if args.debug:
+                debug_path = args.output.with_name(args.output.stem + '_debug.png')
+                if debug_path.exists():
+                    raise FileExistsError(f'Debug output already exists: {debug_path}')
+            result = embed(_load(args.input), args.message, debug=args.debug)
+            image, debug_image = result if args.debug else (result, None)
             _save(image, args.output)
             print(f'Watermark embedded: {args.output}')
+            if args.debug:
+                _save(debug_image, debug_path)
+                print(f'Debug visualization: {debug_path}')
         else:
             result = extract(_load(args.input))
             if result is None:
