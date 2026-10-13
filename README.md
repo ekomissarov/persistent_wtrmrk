@@ -12,7 +12,7 @@ A minimal command-line tool for embedding a short, visually unobtrusive watermar
 | --- | --- |
 | Interface | Python CLI: `embed`, `extract`; optional `--debug` for embedding |
 | Algorithm | One fixed, public, document-aware blind DCT watermark |
-| Inputs | PNG and JPEG, read through Pillow |
+| Inputs | PNG and JPEG, read through Pillow; transparency (RGBA, palette with transparency) is flattened onto white |
 | Outputs | PNG or JPEG; existing files are not overwritten |
 | Payload | 1–16 **UTF-8 bytes**, not necessarily 16 characters |
 | Minimum image size for embedding | 320 × 320 pixels |
@@ -59,6 +59,8 @@ Expected output:
 ```text
 DOC-2026
 ```
+
+Exit codes: `0` success, `1` watermark not found (`extract`), `2` error (invalid arguments, unreadable or too small image, existing output file, no suitable blocks, failed verification).
 
 Visualize where embedding modified DCT coefficients:
 
@@ -136,15 +138,33 @@ Use synthetic document layouts with text, a photograph, patterns and stamps rath
 
 A single successful test does not demonstrate reliability. Report results over multiple document layouts and image transformations. Digital print-scan simulations are useful for development but **cannot replace physical tests**.
 
+### Preliminary digital results (one synthetic layout)
+
+One synthetic 1100 × 1500 px page (random texture, a noise "photo", a text banner and a stamp-like circle), message `DOC-2026`. This is a **single layout with digital transformations only**; it says nothing about printing and scanning.
+
+| Transformation | Recovered | Extraction time |
+| --- | --- | --- |
+| Clean | yes | ~0.2 s |
+| JPEG quality 90 / 75 | yes / yes | ~0.2 s |
+| Crop: left half / 600 × 600 fragment | yes / yes | ~0.2 s / ~0.1 s |
+| Resize ×0.8 / ×1.25 | yes / yes | not recorded |
+| Rotation 0.5° | yes | ~4 s |
+| Unwatermarked image (negative control) | no false detection | ~110 s (full budget) |
+
+## Code layout
+
+Everything lives in `watermark.py`, in sections: format constants, deterministic public layout, message framing and Hamming coding, image I/O, embedding, detection, extraction search, command line. The constants under "Format constants" (block size, tile size, coefficient pair, seed, frame layout, domain strings such as `layout-v5`) define the watermark format; changing any of them makes previously marked files unreadable. The operational limits (size and time limits, thresholds, scale and angle lists) can be tuned without breaking compatibility, although they affect recovery rate and runtime.
+
 ## Limitations and safety
 
 - **No authorship proof:** the watermark identifies only recoverable embedded text; it does not verify who created or owns the image.
 - **No resistance guarantee against removal:** the publicly known algorithm may be intentionally overwritten or disrupted.
-- **Sparse content:** pages consisting mostly of white paper and black text may have insufficient eligible blocks; embedding may fail.
+- **Sparse content:** pages consisting mostly of white paper and black text may have insufficient eligible blocks; embedding may fail. The same applies to weakly textured pages: on a synthetic page with only light background texture, about 3% of blocks were eligible and recovery was not possible, so `embed` refuses instead of writing an unrecoverable file.
 - **Geometric sensitivity:** heavy cropping, large rotations, perspective warps, binarization and repeated scanning may defeat extraction.
 - **Visible artifacts:** especially around complex high-contrast edges or in regions where an embedded signal becomes perceptible.
 - **Document integrity:** the algorithm does not explicitly protect machine-readable zones, barcodes, QR codes, security patterns or text. It should not be used to alter genuine identity documents or relied on for their authenticity checks.
-- **Runtime:** the 110-second budget is approximate because the deadline is checked between search operations; a single expensive operation can overrun it.
+- **Runtime:** the 110-second budget is approximate because the deadline is checked between search operations; a single expensive operation can overrun it. An image that contains no watermark always consumes the whole budget (about 110 s in tests) before `extract` reports failure.
+- **Known decoder quirk:** soft bit values are normalized by the number of grid positions that fall on each tile cell, not by the sum of local weights. This was kept unchanged so that results stay identical; whether weight-based normalization improves recovery has not been tested and should be evaluated on printed and rescanned documents.
 - **File handling:** input images are decoded in memory; the 50 MP limit does not imply a strict RAM limit. Output uses exclusive file creation and is not overwritten.
 
 ## Project status
